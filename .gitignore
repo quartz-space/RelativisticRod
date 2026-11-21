@@ -1,0 +1,73 @@
+## .NET / Visual Studio
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+.vs/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.rsuser
+*.cache
+*.log
+*.binlog
+*.tmp
+*.tmp_proj
+*.dbmdl
+TestResults/
+[Tt]est[Rr]esult*/
+BenchmarkDotNet.Artifacts/
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+project.lock.json
+launchSettings.json.user
+
+## WinUI / MSIX / packaging
+AppPackages/
+BundleArtifacts/
+Generated Files/
+*.appx
+*.appxbundle
+*.appxupload
+*.msix
+*.msixbundle
+*.msixupload
+*.pfx
+*.snk
+*.p12
+*.cer
+*.StoreAssociation.xml
+*_TemporaryKey.pfx
+*.pubxml.user
+PackageUploads/
+
+## Output folders used by the workflows
+publish/
+artifacts/
+dist/
+msix/
+
+## ReSharper / Rider / JetBrains
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+.idea/
+
+## Python (tools/generate_icons.py)
+__pycache__/
+*.pyc
+
+## OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/

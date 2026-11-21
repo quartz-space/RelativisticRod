@@ -1,0 +1,182 @@
+name: Release
+
+# Push a tag like v1.0.0 (or v1.0.0-beta.1) to publish a GitHub release containing
+#   - RelativisticRod-<ver>-win-arm64.zip / win-x64.zip   (unpackaged exe, self-contained)
+#   - RelativisticRod-<ver>-arm64.msix / x64.msix          (signed MSIX)
+#   - RelativisticRod-signing.cer                          (only when a throw-away cert was generated)
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. 1.0.0 or 1.0.0-beta.1 (creates tag v<version>)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      msix: ${{ steps.v.outputs.msix }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - id: v
+        env:
+          RAW: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+        run: |
+          v="${RAW#v}"
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$RAW' is not a valid version (expected e.g. v1.2.3 or v1.2.3-beta.1)"; exit 1
+          fi
+          core="${v%%[-+]*}"
+          echo "version=$v"        >> "$GITHUB_OUTPUT"
+          echo "msix=$core.0"      >> "$GITHUB_OUTPUT"
+          if [[ "$v" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+
+  build:
+    name: Build exe + MSIX
+    needs: meta
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      MSIX_VERSION: ${{ needs.meta.outputs.msix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~\.nuget\packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      # Use a real certificate if SIGNING_CERT_BASE64 / SIGNING_CERT_PASSWORD secrets exist,
+      # otherwise create a throw-away self-signed one (sideload-only; users must trust the .cer).
+      - name: Prepare signing certificate
+        shell: pwsh
+        env:
+          SIGNING_CERT_BASE64: ${{ secrets.SIGNING_CERT_BASE64 }}
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          $selfSigned = $false
+          if ($env:SIGNING_CERT_BASE64) {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_CERT_BASE64))
+            $password = $env:SIGNING_CERT_PASSWORD
+          } else {
+            $selfSigned = $true
+            $password = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(24))
+            Write-Output "::add-mask::$password"
+            $cert = New-SelfSignedCertificate -Type Custom -Subject 'CN=RelativisticRod' `
+              -KeyUsage DigitalSignature -FriendlyName 'RelativisticRod release' `
+              -CertStoreLocation 'Cert:\CurrentUser\My' -KeyExportPolicy Exportable `
+              -NotAfter (Get-Date).AddYears(3) `
+              -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')
+            Export-PfxCertificate -Cert $cert -FilePath $pfx `
+              -Password (ConvertTo-SecureString $password -AsPlainText -Force) | Out-Null
+          }
+
+          $c = [Security.Cryptography.X509Certificates.X509Certificate2]::new($pfx, $password)
+          New-Item -ItemType Directory -Force dist | Out-Null
+          if ($selfSigned) {
+            [IO.File]::WriteAllBytes((Join-Path 'dist' 'RelativisticRod-signing.cer'), $c.Export('Cer'))
+          }
+
+          "PFX_PATH=$pfx"            >> $env:GITHUB_ENV
+          "PFX_PASSWORD=$password"   >> $env:GITHUB_ENV
+          "CERT_SUBJECT=$($c.Subject)" >> $env:GITHUB_ENV
+          "SELF_SIGNED=$selfSigned"  >> $env:GITHUB_ENV
+
+      # MSIX identity Publisher must equal the certificate subject, and the version must be 4-part.
+      - name: Patch package manifest
+        shell: pwsh
+        run: |
+          $path = (Resolve-Path 'Package.appxmanifest').Path
+          [xml]$x = Get-Content $path -Raw
+          $x.Package.Identity.Version   = $env:MSIX_VERSION
+          $x.Package.Identity.Publisher = $env:CERT_SUBJECT
+          $x.Save($path)
+
+      - name: Build exe and MSIX (ARM64 + x64)
+        shell: pwsh
+        run: |
+          $targets = @(
+            @{ Platform = 'ARM64'; Rid = 'win-arm64'; Short = 'arm64' },
+            @{ Platform = 'x64';   Rid = 'win-x64';   Short = 'x64'   }
+          )
+          New-Item -ItemType Directory -Force dist | Out-Null
+
+          foreach ($t in $targets) {
+            Write-Host "::group::$($t.Platform) - unpackaged exe"
+            Remove-Item bin, obj, publish -Recurse -Force -ErrorAction SilentlyContinue
+            dotnet publish RelativisticRod.csproj -c Release -p:Platform=$($t.Platform) -r $($t.Rid) `
+              -p:Version=$env:VERSION -o publish --nologo
+            if ($LASTEXITCODE) { throw "exe publish failed for $($t.Platform)" }
+            Compress-Archive -Path 'publish\*' -DestinationPath "dist\RelativisticRod-$env:VERSION-$($t.Rid).zip" -Force
+            Write-Host "::endgroup::"
+
+            Write-Host "::group::$($t.Platform) - MSIX"
+            Remove-Item bin, obj, msix -Recurse -Force -ErrorAction SilentlyContinue
+            dotnet build RelativisticRod.csproj -c Release -p:Platform=$($t.Platform) `
+              -p:WindowsPackageType=MSIX `
+              -p:GenerateAppxPackageOnBuild=true `
+              -p:AppxBundle=Never `
+              -p:UapAppxPackageBuildMode=SideloadOnly `
+              -p:AppxPackageDir="$env:GITHUB_WORKSPACE\msix\" `
+              -p:AppxPackageSigningEnabled=true `
+              -p:PackageCertificateKeyFile="$env:PFX_PATH" `
+              -p:PackageCertificatePassword="$env:PFX_PASSWORD" `
+              -p:Version=$env:VERSION --nologo
+            if ($LASTEXITCODE) { throw "MSIX build failed for $($t.Platform)" }
+            $msix = Get-ChildItem msix -Recurse -Filter *.msix | Select-Object -First 1
+            if (-not $msix) { throw "No .msix produced for $($t.Platform)" }
+            Copy-Item $msix.FullName "dist\RelativisticRod-$env:VERSION-$($t.Short).msix"
+            Write-Host "::endgroup::"
+          }
+
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.meta.outputs.version }}
+          name: Relativistic Rod Deformation ${{ needs.meta.outputs.version }}
+          prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: dist/*
+          body: |
+            ## Downloads
+            | File | What it is |
+            |---|---|
+            | `RelativisticRod-<ver>-win-arm64.zip` | Portable app for Windows 11 on ARM64 (unzip, run `RelativisticRod.exe`) |
+            | `RelativisticRod-<ver>-win-x64.zip` | Portable app for Windows 10/11 x64 |
+            | `RelativisticRod-<ver>-arm64.msix` / `-x64.msix` | Installable package |
+            | `RelativisticRod-signing.cer` | Certificate for the MSIX (only present for self-signed builds) |
+
+            **Installing the MSIX (self-signed builds):** import `RelativisticRod-signing.cer` into
+            *Local Machine → Trusted People* (admin PowerShell:
+            `Import-Certificate -FilePath .\RelativisticRod-signing.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople`),
+            then double-click the `.msix`.
